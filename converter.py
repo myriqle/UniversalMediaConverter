@@ -1,414 +1,941 @@
 import os
 import sys
+import re
+import shutil
 import subprocess
 import threading
-import time
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-from pathlib import Path
+import webbrowser
+from concurrent.futures import ThreadPoolExecutor
+import customtkinter as ctk
+from tkinter import filedialog
+from tkinterdnd2 import TkinterDnD, DND_FILES
 
-# Try importing TkinterDnD for native drag-and-drop support
-try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD
-    DND_AVAILABLE = True
-except ImportError:
-    DND_AVAILABLE = False
+# Appearance & Theme Configuration
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("blue")
 
-# Flag to prevent background sub-processes from opening black CMD windows on Windows
-CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+# Hide console window when spawning subprocesses on Windows
+CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
-# Supported File Extensions
+
+# BUNDLED BINARY RESOLUTION
+#
+# The app ships ffmpeg / ffmpeg.exe and yt-dlp / yt-dlp.exe next to the
+# executable (see the build/README notes). We look for those first so end
+# users never have to install anything themselves. If they're missing
+# (e.g. running from source during development) we fall back to PATH.
+
+def get_app_dir():
+    """Directory the running exe lives in (or the script dir when not frozen)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _find_bundled(name):
+    exe_name = f"{name}.exe" if sys.platform == "win32" else name
+    candidate = os.path.join(get_app_dir(), exe_name)
+    if os.path.isfile(candidate):
+        return candidate
+    return shutil.which(name)
+
+
+def get_ffmpeg_path():
+    return _find_bundled("ffmpeg")
+
+
+def get_ffprobe_path():
+    return _find_bundled("ffprobe")
+
+
+def get_ytdlp_path():
+    return _find_bundled("yt-dlp")
+
+
+FFMPEG_PATH = get_ffmpeg_path()
+FFPROBE_PATH = get_ffprobe_path()
+YTDLP_PATH = get_ytdlp_path()
+HAS_YTDLP = YTDLP_PATH is not None
+
+# EXTENSION SETS & DIALOG FILTERS
 VIDEO_EXTS = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv', '.m4v', '.ts', '.m2ts', '.vob', '.3gp'}
 AUDIO_EXTS = {'.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a', '.wma', '.opus', '.alac', '.aiff'}
 IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.tif', '.gif'}
 
+SUPPORTED_EXTS = VIDEO_EXTS | AUDIO_EXTS | IMAGE_EXTS
+
 FILE_TYPES = [
     ("All Supported Media", "*.mp4 *.mkv *.avi *.mov *.webm *.flv *.wmv *.mp3 *.wav *.flac *.aac *.ogg *.m4a *.png *.jpg *.jpeg *.webp *.bmp *.gif"),
-    ("Video Files", "*.mp4 *.mkv *.avi *.mov *.webm *.flv *.wmv *.m4v *.ts"),
-    ("Audio Files", "*.mp3 *.wav *.flac *.aac *.ogg *.m4a *.wma *.opus"),
-    ("Image Files", "*.png *.jpg *.jpeg *.webp *.bmp *.gif *.tiff"),
+    ("Video Files", "*.mp4 *.mkv *.avi *.mov *.webm *.flv *.wmv *.m4v *.ts *.m2ts *.vob *.3gp"),
+    ("Audio Files", "*.mp3 *.wav *.flac *.aac *.ogg *.m4a *.wma *.opus *.alac *.aiff"),
+    ("Image Files", "*.png *.jpg *.jpeg *.webp *.bmp *.gif *.tiff *.tif"),
     ("All Files", "*.*")
 ]
 
-def get_ffmpeg_path() -> str:
-    """Finds bundled ffmpeg.exe (PyInstaller/Nuitka) or checks next to .exe or system PATH."""
-    if hasattr(sys, '_MEIPASS'):
-        bundled = os.path.join(sys._MEIPASS, 'ffmpeg.exe')
-        if os.path.exists(bundled):
-            return bundled
-    
-    local_ffmpeg = Path(sys.argv[0]).parent / "ffmpeg.exe"
-    if local_ffmpeg.exists():
-        return str(local_ffmpeg)
-        
-    return "ffmpeg"
+CATEGORY_MAP = {
+    "Video": ["MP4", "MKV", "MOV", "AVI", "WEBM", "FLV", "WMV", "M4V", "TS", "M2TS", "VOB", "3GP"],
+    "Audio": ["MP3", "WAV", "FLAC", "AAC", "OGG", "M4A", "WMA", "OPUS", "ALAC", "AIFF"],
+    "Image": ["PNG", "JPG", "WEBP", "BMP", "TIFF", "GIF"]
+}
 
-def auto_detect_gpu() -> str:
-    """Detects available GPU vendor on Windows using PowerShell/WMI without popping up a CMD window."""
+AUDIO_TARGET_KEYS = {ext.replace('.', '') for ext in AUDIO_EXTS}
+STATIC_IMAGE_KEYS = {ext.replace('.', '') for ext in IMAGE_EXTS} - {'gif'}
+VIDEO_TARGET_KEYS = {ext.replace('.', '') for ext in VIDEO_EXTS}
+
+
+# PRE-FLIGHT CHECK & HARDWARE PROBING
+
+def check_ffmpeg_installed():
+    global FFMPEG_PATH, FFPROBE_PATH
+    FFMPEG_PATH = get_ffmpeg_path()
+    FFPROBE_PATH = get_ffprobe_path()
+    return FFMPEG_PATH is not None
+
+
+def test_encoder(encoder_name):
     try:
-        cmd = ["powershell", "-Command", "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"]
-        output = subprocess.check_output(
-            cmd, 
-            text=True, 
-            stderr=subprocess.DEVNULL,
-            creationflags=CREATE_NO_WINDOW
-        ).lower()
-        
-        if "nvidia" in output or "geforce" in output or "quadro" in output:
-            return "NVIDIA (NVENC)"
-        elif "amd" in output or "radeon" in output:
-            return "AMD (AMF)"
-        elif "intel" in output or "arc" in output or "iris" in output:
-            return "Intel (QSV)"
+        cmd = [
+            FFMPEG_PATH, "-y", "-f", "lavfi", "-i", "color=c=black:s=256x256:d=1",
+            "-c:v", encoder_name, "-frames:v", "1", "-f", "null", "-"
+        ]
+        process = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=CREATE_NO_WINDOW, encoding="utf-8", errors="ignore"
+        )
+        return process.returncode == 0
     except Exception:
-        pass
-    return "CPU Only (Software)"
+        return False
 
-class UniversalConverterGUI:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Universal Media Converter")
-        self.root.geometry("640x450")
-        self.root.resizable(False, False)
 
-        self.selected_files = []
-        self.show_advanced = tk.BooleanVar(value=False)
+def detect_gpu_encoder():
+    if test_encoder("h264_amf"):
+        return "amf"
+    if test_encoder("h264_nvenc"):
+        return "nvenc"
+    if test_encoder("h264_qsv"):
+        return "qsv"
+    return "cpu"
 
-        # UI Styling
-        self.style = ttk.Style()
-        self.style.theme_use('vista' if 'vista' in self.style.theme_names() else 'default')
-        self.style.configure(".", font=("Segoe UI", 9))
 
-        self.create_widgets()
-        self.detect_hardware()
+# APPLICATION CLASS
 
-    def create_widgets(self):
-        # --- 1. File Selection Area (Clickable Dropzone) ---
-        file_frame = ttk.LabelFrame(self.root, text=" 1. Files to Convert ", padding=10)
-        file_frame.pack(fill="x", padx=15, pady=(10, 5))
+class ModernConverterApp(ctk.CTk, TkinterDnD.DnDWrapper):
+    def __init__(self):
+        super().__init__()
+        self.TkdndVersion = TkinterDnD._require(self)
 
-        list_container = ttk.Frame(file_frame)
-        list_container.pack(fill="both", expand=True)
+        # Window Configuration
+        self.title("Universal Media Converter v1.4.0 (with Downloader)")
+        self.geometry("920x720")
+        self.minsize(820, 620)
 
-        self.file_listbox = tk.Listbox(
-            list_container, 
-            height=4, 
-            selectmode=tk.EXTENDED, 
-            relief="solid", 
-            bd=1,
-            font=("Segoe UI", 9),
-            cursor="hand2"
+        # Pre-flight Check
+        self.ffmpeg_available = check_ffmpeg_installed()
+        self.gpu_type = detect_gpu_encoder() if self.ffmpeg_available else "cpu"
+
+        # State & Process Tracking (Converter)
+        self.file_queue = []
+        self.active_processes = []
+        self.is_processing = False
+        self.cancel_requested = False
+        self.completed_count = 0
+        self.queue_lock = threading.Lock()
+        self.custom_output_dir = ""
+
+        # State Tracking (Downloader)
+        self.dl_custom_output_dir = ""
+
+        self._build_ui()
+        self._setup_dnd()
+        self._setup_shortcuts()
+
+        if not self.ffmpeg_available:
+            self.after(200, self._show_ffmpeg_warning)
+
+    def _build_ui(self):
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1) # Makes the TabView expand
+
+        # HEADER
+        self.header_frame = ctk.CTkFrame(self, corner_radius=10)
+        self.header_frame.grid(row=0, column=0, padx=15, pady=(15, 10), sticky="ew")
+
+        self.title_label = ctk.CTkLabel(
+            self.header_frame, 
+            text="🎬 Universal Media Toolkit", 
+            font=ctk.CTkFont(size=20, weight="bold")
         )
-        self.file_listbox.pack(side="left", fill="both", expand=True, padx=(0, 5))
+        self.title_label.pack(side="left", padx=15, pady=12)
+
+        if not self.ffmpeg_available:
+            gpu_status_text = "⚠️ FFmpeg Missing!"
+            gpu_color = "#EF5350"
+        else:
+            gpu_status_text = f"Hardware Engine: {self.gpu_type.upper()}" if self.gpu_type != "cpu" else "Engine: CPU (Software Fallback)"
+            gpu_color = "#66BB6A" if self.gpu_type != "cpu" else "#FFA000"
+
+        self.subtitle_label = ctk.CTkLabel(
+            self.header_frame, 
+            text=gpu_status_text, 
+            font=ctk.CTkFont(size=12),
+            text_color=gpu_color
+        )
+        self.subtitle_label.pack(side="right", padx=15, pady=12)
+
+        # TABS
+        self.tabview = ctk.CTkTabview(self)
+        self.tabview.grid(row=1, column=0, padx=15, pady=(0, 15), sticky="nsew")
+
+        self.tab_converter = self.tabview.add("🔄 Converter")
+        self.tab_downloader = self.tabview.add("⬇️ YouTube Downloader")
+
+        # ==========================================
+        # TAB 1: CONVERTER (100% Original Logic)
+        # ==========================================
+        self.tab_converter.grid_columnconfigure(0, weight=1)
+        self.tab_converter.grid_rowconfigure(0, weight=1) # Queue expands
+
+        # QUEUE LIST
+        self.queue_frame = ctk.CTkScrollableFrame(self.tab_converter, label_text="Conversion Queue (Drop files or press Ctrl+O)")
+        self.queue_frame.grid(row=0, column=0, padx=5, pady=5, sticky="nsew")
+
+        self.empty_label = ctk.CTkLabel(
+            self.queue_frame,
+            text="📥 Drag & Drop Media Files Here to Begin",
+            font=ctk.CTkFont(size=16, weight="bold"),
+            text_color="gray"
+        )
+        self.empty_label.pack(pady=100)
+
+        # DESTINATION SELECTOR 
+        self.dest_frame = ctk.CTkFrame(self.tab_converter, corner_radius=10)
+        self.dest_frame.grid(row=1, column=0, padx=5, pady=(5, 5), sticky="ew")
+
+        self.dest_label = ctk.CTkLabel(self.dest_frame, text="Output Path:", font=ctk.CTkFont(weight="bold"))
+        self.dest_label.pack(side="left", padx=(15, 5), pady=8)
+
+        self.dest_entry = ctk.CTkEntry(self.dest_frame, placeholder_text="Same as Source Directory", width=400)
+        self.dest_entry.pack(side="left", padx=5, pady=8, fill="x", expand=True)
+        self.dest_entry.configure(state="disabled")
+
+        self.browse_btn = ctk.CTkButton(
+            self.dest_frame, text="Browse...", width=90, command=self._browse_output_folder
+        )
+        self.browse_btn.pack(side="left", padx=5, pady=8)
+
+        self.reset_dest_btn = ctk.CTkButton(
+            self.dest_frame, text="Reset", width=60, fg_color="#555555", hover_color="#333333", command=self._reset_output_folder
+        )
+        self.reset_dest_btn.pack(side="left", padx=(5, 15), pady=8)
+
+        # CONTROLS
+        self.controls_frame = ctk.CTkFrame(self.tab_converter, corner_radius=10)
+        self.controls_frame.grid(row=2, column=0, padx=5, pady=10, sticky="ew")
+
+        # Category Filter Dropdown
+        self.cat_label = ctk.CTkLabel(self.controls_frame, text="Category:", font=ctk.CTkFont(weight="bold"))
+        self.cat_label.pack(side="left", padx=(15, 5), pady=12)
+
+        self.cat_dropdown = ctk.CTkOptionMenu(
+            self.controls_frame, 
+            values=list(CATEGORY_MAP.keys()),
+            command=self._on_category_change,
+            width=100
+        )
+        self.cat_dropdown.pack(side="left", padx=5, pady=12)
+
+        # Target Format Dropdown
+        self.format_label = ctk.CTkLabel(self.controls_frame, text="Format:", font=ctk.CTkFont(weight="bold"))
+        self.format_label.pack(side="left", padx=(10, 5), pady=12)
+
+        self.format_dropdown = ctk.CTkOptionMenu(
+            self.controls_frame, 
+            values=CATEGORY_MAP["Video"],
+            width=100
+        )
+        self.format_dropdown.pack(side="left", padx=5, pady=12)
+
+        # Stream Copy Checkbox
+        self.stream_copy_var = ctk.BooleanVar(value=False)
+        self.stream_copy_cb = ctk.CTkCheckBox(
+            self.controls_frame, 
+            text="⚡ Fast Remux (-c copy)", 
+            variable=self.stream_copy_var,
+            font=ctk.CTkFont(size=12)
+        )
+        self.stream_copy_cb.pack(side="left", padx=15, pady=12)
+
+        # Action Buttons
+        self.clear_btn = ctk.CTkButton(
+            self.controls_frame, 
+            text="Clear Queue", 
+            fg_color="#D32F2F", 
+            hover_color="#9A0007",
+            width=100,
+            command=self.clear_queue
+        )
+        self.clear_btn.pack(side="right", padx=15, pady=12)
+
+        self.action_btn = ctk.CTkButton(
+            self.controls_frame, 
+            text="Start Batch", 
+            fg_color="#2E7D32", 
+            hover_color="#1B5E20",
+            font=ctk.CTkFont(weight="bold"),
+            width=110,
+            command=self.toggle_batch_execution
+        )
+        self.action_btn.pack(side="right", padx=5, pady=12)
+
+        # PROGRESS FOOTER 
+        self.progress_frame = ctk.CTkFrame(self.tab_converter, corner_radius=10)
+        self.progress_frame.grid(row=3, column=0, padx=5, pady=(5, 5), sticky="ew")
+
+        self.progress_bar = ctk.CTkProgressBar(self.progress_frame)
+        self.progress_bar.pack(fill="x", padx=15, pady=(12, 5))
+        self.progress_bar.set(0)
+
+        self.status_info_label = ctk.CTkLabel(
+            self.progress_frame, 
+            text="Ready to process", 
+            font=ctk.CTkFont(size=12),
+            text_color="gray"
+        )
+        self.status_info_label.pack(side="left", padx=15, pady=(0, 10))
+
+        self.open_folder_btn = ctk.CTkButton(
+            self.progress_frame,
+            text="📁 Open Output Folder",
+            width=140,
+            fg_color="#333333",
+            hover_color="#444444",
+            command=self._open_output_folder
+        )
+
+        # ==========================================
+        # TAB 2: YOUTUBE DOWNLOADER
+        # ==========================================
+        self.tab_downloader.grid_columnconfigure(0, weight=1)
         
-        # Click listbox area to open file browser
-        self.file_listbox.bind("<Button-1>", self.on_listbox_click)
-
-        # Configure Drag & Drop on the listbox if library is available
-        if DND_AVAILABLE:
-            self.file_listbox.drop_target_register(DND_FILES)
-            self.file_listbox.dnd_bind('<<Drop>>', self.on_file_drop)
-            placeholder = " 📥 Drag & Drop files here, or click to browse"
-        else:
-            placeholder = " 📁 Click here or press 'Add Files...' to select media files"
-
-        scrollbar = ttk.Scrollbar(list_container, orient="vertical", command=self.file_listbox.yview)
-        scrollbar.pack(side="left", fill="y", padx=(0, 10))
-        self.file_listbox.config(yscrollcommand=scrollbar.set)
-
-        self.file_listbox.insert(tk.END, placeholder)
-
-        btn_box = ttk.Frame(list_container)
-        btn_box.pack(side="right", fill="y")
-
-        ttk.Button(btn_box, text="Add Files...", command=self.browse_files).pack(fill="x", pady=2)
-        ttk.Button(btn_box, text="Clear", command=self.clear_files).pack(fill="x", pady=2)
-
-        # --- 2. Conversion Settings Frame ---
-        settings_frame = ttk.LabelFrame(self.root, text=" 2. Output Settings ", padding=10)
-        settings_frame.pack(fill="x", padx=15, pady=5)
-
-        # Category Dropdown
-        ttk.Label(settings_frame, text="Media Type:").grid(row=0, column=0, sticky="w", pady=4)
-        self.category_var = tk.StringVar(value="Video")
-        cat_cb = ttk.Combobox(settings_frame, textvariable=self.category_var, state="readonly", width=32)
-        cat_cb['values'] = ("Video", "Audio", "Image")
-        cat_cb.grid(row=0, column=1, sticky="w", padx=10, pady=4)
-        cat_cb.bind("<<ComboboxSelected>>", self.update_format_options)
-
-        # Format Dropdown
-        ttk.Label(settings_frame, text="Target Format:").grid(row=1, column=0, sticky="w", pady=4)
-        self.format_var = tk.StringVar()
-        self.format_cb = ttk.Combobox(settings_frame, textvariable=self.format_var, state="readonly", width=32)
-        self.format_cb.grid(row=1, column=1, sticky="w", padx=10, pady=4)
-
-        # Hardware Acceleration Selection
-        ttk.Label(settings_frame, text="GPU Hardware:").grid(row=2, column=0, sticky="w", pady=4)
-        self.gpu_var = tk.StringVar(value="Detecting...")
-        self.gpu_cb = ttk.Combobox(settings_frame, textvariable=self.gpu_var, state="readonly", width=32)
-        self.gpu_cb['values'] = ("NVIDIA (NVENC)", "AMD (AMF)", "Intel (QSV)", "CPU Only (Software)")
-        self.gpu_cb.grid(row=2, column=1, sticky="w", padx=10, pady=4)
-
-        self.update_format_options()
-
-        # --- 3. Progress Section ---
-        progress_frame = ttk.LabelFrame(self.root, text=" 3. Status & Progress ", padding=10)
-        progress_frame.pack(fill="x", padx=15, pady=5)
-
-        self.status_label = ttk.Label(progress_frame, text="Ready", font=("Segoe UI", 9, "bold"))
-        self.status_label.pack(anchor="w", pady=(0, 4))
-
-        self.progress_var = tk.DoubleVar(value=0.0)
-        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var, maximum=100)
-        self.progress_bar.pack(fill="x", pady=2)
-
-        # Advanced Logs Toggle
-        adv_box = ttk.Frame(progress_frame)
-        adv_box.pack(fill="x", pady=(5, 0))
-
-        self.adv_btn = ttk.Checkbutton(
-            adv_box, 
-            text="🔍 Show Advanced Logs", 
-            variable=self.show_advanced, 
-            command=self.toggle_advanced_log
-        )
-        self.adv_btn.pack(side="left")
-
-        # Collapsible Log Frame
-        self.log_frame = ttk.LabelFrame(self.root, text=" Detailed Console Log ", padding=8)
-        self.log_text = tk.Text(
-            self.log_frame, 
-            height=8, 
-            wrap="word", 
-            bg="#1e1e1e", 
-            fg="#00ff00", 
-            font=("Consolas", 8),
-            state="disabled"
-        )
-        self.log_text.pack(fill="both", expand=True)
-
-        # Action Button
-        self.start_btn = ttk.Button(self.root, text="⚡ Start Conversion", command=self.start_conversion_thread)
-        self.start_btn.pack(pady=10, ipadx=20, ipady=4)
-
-    def detect_hardware(self):
-        detected = auto_detect_gpu()
-        self.gpu_var.set(detected)
-        self.log(f"System Check: Detected Hardware Acceleration -> {detected}")
-        if DND_AVAILABLE:
-            self.log("UI Check: Native Drag & Drop enabled")
-
-    def on_listbox_click(self, event):
-        if not self.selected_files:
-            self.browse_files()
-
-    def on_file_drop(self, event):
-        """Handles drag and drop files from Windows File Explorer."""
-        dropped_files = self.root.tk.splitlist(event.data)
-        self.add_files(dropped_files)
-
-    def toggle_advanced_log(self):
-        if self.show_advanced.get():
-            self.log_frame.pack(fill="both", expand=True, padx=15, pady=(0, 5))
-            self.root.geometry("640x630")
-        else:
-            self.log_frame.pack_forget()
-            self.root.geometry("640x450")
-
-    def update_format_options(self, event=None):
-        category = self.category_var.get()
-        if category == "Video":
-            formats = ("HEVC (H.265) [.mp4]", "AVC (H.264) [.mp4]", "WebM (VP9) [.webm]", "Animated GIF [.gif]")
-            self.gpu_cb.config(state="readonly")
-        elif category == "Audio":
-            formats = ("MP3 [.mp3]", "AAC [.m4a]", "WAV [.wav]", "FLAC [.flac]", "OGG [.ogg]")
-            self.gpu_cb.config(state="disabled")
-        else:  # Image
-            formats = ("PNG [.png]", "JPEG [.jpg]", "WEBP [.webp]", "GIF [.gif]", "BMP [.bmp]")
-            self.gpu_cb.config(state="disabled")
-
-        self.format_cb['values'] = formats
-        self.format_var.set(formats[0])
-
-    def log(self, text: str):
-        self.log_text.config(state="normal")
-        self.log_text.insert(tk.END, text + "\n")
-        self.log_text.see(tk.END)
-        self.log_text.config(state="disabled")
-
-    def add_files(self, file_paths):
-        """Helper to append files and auto-detect category."""
-        if file_paths:
-            if not self.selected_files:
-                self.file_listbox.delete(0, tk.END)
-
-            for f in file_paths:
-                p = Path(f)
-                if p.is_file() and str(p) not in self.selected_files:
-                    self.selected_files.append(str(p))
-                    self.file_listbox.insert(tk.END, f"  {p.name}")
-
-            if self.selected_files:
-                first_ext = Path(self.selected_files[0]).suffix.lower()
-                if first_ext in AUDIO_EXTS:
-                    self.category_var.set("Audio")
-                elif first_ext in IMAGE_EXTS:
-                    self.category_var.set("Image")
-                elif first_ext in VIDEO_EXTS:
-                    self.category_var.set("Video")
-                self.update_format_options()
-
-    def browse_files(self):
-        files = filedialog.askopenfilenames(title="Select Media Files", filetypes=FILE_TYPES)
-        self.add_files(files)
-
-    def clear_files(self):
-        self.selected_files.clear()
-        self.file_listbox.delete(0, tk.END)
-        placeholder = " 📥 Drag & Drop files here, or click to browse" if DND_AVAILABLE else " 📁 Click here or press 'Add Files...' to select media files"
-        self.file_listbox.insert(tk.END, placeholder)
-        self.status_label.config(text="Ready")
-        self.progress_var.set(0.0)
-
-    def get_video_encoder(self, is_hevc: bool, hw_type: str) -> tuple[list, str, str]:
-        if "NVIDIA" in hw_type:
-            encoder = "hevc_nvenc" if is_hevc else "h264_nvenc"
-            return ([encoder, "-preset", "p2"], "-cq", "28" if is_hevc else "23")
-        elif "AMD" in hw_type:
-            encoder = "hevc_amf" if is_hevc else "h264_amf"
-            return ([encoder, "-quality", "speed"], "-rc", "cqp")
-        elif "Intel" in hw_type:
-            encoder = "hevc_qsv" if is_hevc else "h264_qsv"
-            return ([encoder, "-preset", "veryfast"], "-global_quality", "28" if is_hevc else "23")
-        else:
-            encoder = "libx265" if is_hevc else "libx264"
-            return ([encoder, "-preset", "ultrafast"], "-crf", "28" if is_hevc else "23")
-
-    def run_ffmpeg_command(self, cmd: list, base_pct: float, file_weight: float):
-        """Runs FFmpeg silently in the background while animating progress."""
-        process = subprocess.Popen(
-            cmd, 
-            stdout=subprocess.PIPE, 
-            stderr=subprocess.PIPE, 
-            text=True,
-            creationflags=CREATE_NO_WINDOW  # Prevents black CMD window popping up
-        )
+        # URL Input
+        self.dl_input_frame = ctk.CTkFrame(self.tab_downloader, corner_radius=10)
+        self.dl_input_frame.grid(row=0, column=0, padx=5, pady=10, sticky="ew")
         
-        stderr_lines = []
-        def read_stderr():
-            for line in process.stderr:
-                stderr_lines.append(line)
+        self.dl_url_label = ctk.CTkLabel(self.dl_input_frame, text="Video URL:", font=ctk.CTkFont(weight="bold"))
+        self.dl_url_label.pack(side="left", padx=(15, 5), pady=15)
+        
+        self.dl_url_entry = ctk.CTkEntry(self.dl_input_frame, placeholder_text="Paste YouTube link here...")
+        self.dl_url_entry.pack(side="left", padx=5, pady=15, fill="x", expand=True)
+        
+        self.dl_format_label = ctk.CTkLabel(self.dl_input_frame, text="Format:", font=ctk.CTkFont(weight="bold"))
+        self.dl_format_label.pack(side="left", padx=(10, 5), pady=15)
+        
+        self.dl_format_dropdown = ctk.CTkOptionMenu(
+            self.dl_input_frame, 
+            values=["Video (Best MP4)", "Audio (MP3)"], 
+            width=140
+        )
+        self.dl_format_dropdown.pack(side="left", padx=(5, 15), pady=15)
 
-        reader_thread = threading.Thread(target=read_stderr, daemon=True)
-        reader_thread.start()
+        # Destination Selector
+        self.dl_dest_frame = ctk.CTkFrame(self.tab_downloader, corner_radius=10)
+        self.dl_dest_frame.grid(row=1, column=0, padx=5, pady=5, sticky="ew")
 
-        simulated_file_pct = 0.0
+        self.dl_dest_label = ctk.CTkLabel(self.dl_dest_frame, text="Save To:", font=ctk.CTkFont(weight="bold"))
+        self.dl_dest_label.pack(side="left", padx=(15, 5), pady=8)
 
-        while process.poll() is None:
-            time.sleep(0.1)
-            simulated_file_pct += (95.0 - simulated_file_pct) * 0.02
-            current_total = base_pct + (simulated_file_pct / 100.0) * file_weight
-            self.progress_var.set(current_total)
+        self.dl_dest_entry = ctk.CTkEntry(self.dl_dest_frame, placeholder_text="Default: Downloads folder")
+        self.dl_dest_entry.pack(side="left", padx=5, pady=8, fill="x", expand=True)
+        self.dl_dest_entry.configure(state="disabled")
 
-        reader_thread.join()
-        stderr_text = "".join(stderr_lines)
+        self.dl_browse_btn = ctk.CTkButton(
+            self.dl_dest_frame, text="Browse...", width=90, command=self._browse_dl_output_folder
+        )
+        self.dl_browse_btn.pack(side="left", padx=5, pady=8)
 
-        if process.returncode != 0:
-            raise subprocess.CalledProcessError(process.returncode, cmd, output="", stderr=stderr_text)
+        self.dl_reset_btn = ctk.CTkButton(
+            self.dl_dest_frame, text="Reset", width=60, fg_color="#555555", hover_color="#333333", command=self._reset_dl_output_folder
+        )
+        self.dl_reset_btn.pack(side="left", padx=(5, 15), pady=8)
+        
+        # Download Action & Progress
+        self.dl_action_frame = ctk.CTkFrame(self.tab_downloader, corner_radius=10)
+        self.dl_action_frame.grid(row=2, column=0, padx=5, pady=10, sticky="ew")
+        
+        self.dl_action_btn = ctk.CTkButton(
+            self.dl_action_frame, 
+            text="⬇️ Start Download", 
+            fg_color="#2E7D32", 
+            hover_color="#1B5E20",
+            font=ctk.CTkFont(weight="bold", size=14),
+            height=40,
+            command=self.start_download
+        )
+        self.dl_action_btn.pack(pady=15, padx=15, fill="x")
+        
+        self.dl_progress_bar = ctk.CTkProgressBar(self.dl_action_frame)
+        self.dl_progress_bar.pack(fill="x", padx=15, pady=(0, 5))
+        self.dl_progress_bar.set(0)
+        
+        self.dl_status_label = ctk.CTkLabel(
+            self.dl_action_frame, 
+            text="Ready" if HAS_YTDLP else "⚠️ yt-dlp is missing. Please run: pip install yt-dlp", 
+            font=ctk.CTkFont(size=12),
+            text_color="gray" if HAS_YTDLP else "#EF5350"
+        )
+        self.dl_status_label.pack(side="left", padx=15, pady=(0, 15))
 
-        self.progress_var.set(base_pct + file_weight)
+        self.dl_open_folder_btn = ctk.CTkButton(
+            self.dl_action_frame,
+            text="📁 Open Folder",
+            width=120,
+            fg_color="#333333",
+            hover_color="#444444",
+            command=self._open_dl_output_folder
+        )
+        self.dl_open_folder_btn.pack(side="right", padx=15, pady=(0, 15))
 
-    def start_conversion_thread(self):
-        if not self.selected_files:
-            messagebox.showwarning("No Files", "Please add at least one file to convert.")
+
+    # ==========================================
+    # GLOBAL & CONVERTER METHODS (Unchanged)
+    # ==========================================
+
+    def _setup_shortcuts(self):
+        """Bind lightweight keyboard shortcuts."""
+        self.bind("<Control-o>", lambda e: self._open_file_dialog())
+        self.bind("<Return>", lambda e: self.toggle_batch_execution())
+        self.bind("<Delete>", lambda e: self.clear_queue())
+
+    def _open_file_dialog(self):
+        """Open system file picker via Ctrl+O."""
+        files = filedialog.askopenfilenames(filetypes=FILE_TYPES)
+        if files:
+            for file_path in files:
+                ext = os.path.splitext(file_path)[1].lower()
+                if ext in SUPPORTED_EXTS:
+                    if self.empty_label.winfo_exists():
+                        self.empty_label.destroy()
+                    self.add_file_to_queue(file_path)
+
+    def _show_ffmpeg_warning(self):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("FFmpeg Missing")
+        dialog.geometry("450x220")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        msg = ctk.CTkLabel(
+            dialog, 
+            text="⚠️ FFmpeg was not found.\n\nThis app expects ffmpeg.exe to be bundled next to it. If you're\nrunning from source, install FFmpeg and add it to PATH, or drop\nffmpeg.exe/ffprobe.exe into this app's folder.",
+            wraplength=400,
+            font=ctk.CTkFont(size=13)
+        )
+        msg.pack(pady=20, padx=20)
+
+        btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_frame.pack(pady=10)
+
+        dl_btn = ctk.CTkButton(
+            btn_frame, 
+            text="Download FFmpeg", 
+            fg_color="#1976D2", 
+            command=lambda: webbrowser.open("https://ffmpeg.org/download.html")
+        )
+        dl_btn.pack(side="left", padx=10)
+
+        close_btn = ctk.CTkButton(btn_frame, text="Dismiss", fg_color="#555555", command=dialog.destroy)
+        close_btn.pack(side="left", padx=10)
+
+    def _browse_output_folder(self):
+        folder = filedialog.askdirectory()
+        if folder:
+            self.custom_output_dir = folder
+            self.dest_entry.configure(state="normal")
+            self.dest_entry.delete(0, "end")
+            self.dest_entry.insert(0, folder)
+            self.dest_entry.configure(state="disabled")
+
+    def _reset_output_folder(self):
+        self.custom_output_dir = ""
+        self.dest_entry.configure(state="normal")
+        self.dest_entry.delete(0, "end")
+        self.dest_entry.configure(state="disabled")
+
+    def _open_output_folder(self):
+        target_dir = self.custom_output_dir if self.custom_output_dir else (
+            os.path.dirname(self.file_queue[0]['path']) if self.file_queue else os.path.expanduser("~")
+        )
+        if os.path.exists(target_dir):
+            if sys.platform == "win32":
+                os.startfile(target_dir)
+            else:
+                subprocess.run(["open" if sys.platform == "darwin" else "xdg-open", target_dir])
+
+    def _on_category_change(self, selected_category):
+        formats = CATEGORY_MAP.get(selected_category, [])
+        self.format_dropdown.configure(values=formats)
+        if formats:
+            self.format_dropdown.set(formats[0])
+
+    def _setup_dnd(self):
+        self.drop_target_register(DND_FILES)
+        self.dnd_bind("<<Drop>>", self.handle_drop)
+
+    def handle_drop(self, event):
+        self.tabview.set("🔄 Converter") # Auto-switch to converter tab on drop
+        files = self.parse_drop_files(event.data)
+        if files:
+            for file_path in files:
+                if os.path.isfile(file_path):
+                    ext = os.path.splitext(file_path)[1].lower()
+                    if ext in SUPPORTED_EXTS:
+                        if self.empty_label.winfo_exists():
+                            self.empty_label.destroy()
+                        self.add_file_to_queue(file_path)
+
+    def parse_drop_files(self, data):
+        if not data:
+            return []
+        if data.startswith('{'):
+            return re.findall(r'\{([^}]+)\}', data)
+        return data.split()
+
+    def add_file_to_queue(self, path):
+        if any(item['path'] == path for item in self.file_queue):
             return
 
-        self.start_btn.config(state="disabled")
-        self.progress_var.set(0.0)
-        threading.Thread(target=self.run_conversion, daemon=True).start()
+        filename = os.path.basename(path)
+        
+        row = ctk.CTkFrame(self.queue_frame, corner_radius=6)
+        row.pack(fill="x", padx=5, pady=4)
 
-    def run_conversion(self):
-        ffmpeg = get_ffmpeg_path()
-        category = self.category_var.get()
-        target_fmt = self.format_var.get()
-        total_files = len(self.selected_files)
+        name_lbl = ctk.CTkLabel(row, text=filename, font=ctk.CTkFont(weight="bold"), anchor="w")
+        name_lbl.pack(side="left", padx=10, pady=8, expand=True, fill="x")
 
-        self.log("=" * 50)
-        self.log(f"Batch Start: {total_files} {category} file(s)")
+        status_lbl = ctk.CTkLabel(row, text="Queued", text_color="#FFA000", font=ctk.CTkFont(size=12))
+        status_lbl.pack(side="right", padx=10, pady=8)
 
-        for index, filepath in enumerate(list(self.selected_files), start=1):
-            input_file = Path(filepath)
-            
-            self.status_label.config(text=f"Converting ({index}/{total_files}): {input_file.name}")
-            self.log(f"\n[{index}/{total_files}] Processing: {input_file.name}")
+        remove_btn = ctk.CTkButton(
+            row, text="✕", width=28, height=28, 
+            fg_color="transparent", hover_color="#333333",
+            command=lambda: self.remove_from_queue(path, row)
+        )
+        remove_btn.pack(side="right", padx=5)
 
-            base_pct = ((index - 1) / total_files) * 100.0
-            file_weight = 100.0 / total_files
+        self.file_queue.append({
+            'path': path, 
+            'frame': row, 
+            'status_lbl': status_lbl, 
+            'remove_btn': remove_btn
+        })
 
-            # --- VIDEO CONVERSION ---
-            if category == "Video":
-                gpu_type = self.gpu_var.get()
-                
-                hw_decode = []
-                if "NVIDIA" in gpu_type:
-                    hw_decode = ["-hwaccel", "cuda"]
-                elif "Intel" in gpu_type:
-                    hw_decode = ["-hwaccel", "qsv"]
-                elif "AMD" in gpu_type:
-                    hw_decode = ["-hwaccel", "dxva2"]
+    def remove_from_queue(self, path, frame_widget):
+        if self.is_processing:
+            return
+        self.file_queue = [item for item in self.file_queue if item['path'] != path]
+        frame_widget.destroy()
 
-                if "GIF" in target_fmt:
-                    out_ext = ".gif"
-                    output_file = input_file.parent / f"{input_file.stem}_converted{out_ext}"
-                    cmd = [ffmpeg, "-y"] + hw_decode + ["-i", str(input_file), "-vf", "fps=12,scale=480:-1:flags=lanczos", str(output_file)]
-                elif "WebM" in target_fmt:
-                    out_ext = ".webm"
-                    output_file = input_file.parent / f"{input_file.stem}_converted{out_ext}"
-                    cmd = [ffmpeg, "-y"] + hw_decode + ["-i", str(input_file), "-c:v", "libvpx-vp9", "-c:a", "libopus", str(output_file)]
-                else:
-                    is_hevc = "HEVC" in target_fmt
-                    out_ext = ".mp4"
-                    output_file = input_file.parent / f"{input_file.stem}_converted{out_ext}"
-                    
-                    encoder_args, q_flag, q_val = self.get_video_encoder(is_hevc, gpu_type)
-                    cmd = [ffmpeg, "-y"] + hw_decode + ["-i", str(input_file), "-c:v"] + encoder_args + [q_flag, q_val, "-c:a", "aac", "-b:a", "192k", str(output_file)]
+    def clear_queue(self):
+        if self.is_processing:
+            return
+        for item in self.file_queue:
+            item['frame'].destroy()
+        self.file_queue.clear()
 
-            # --- AUDIO CONVERSION ---
-            elif category == "Audio":
-                out_ext = target_fmt.split("[")[1].replace("]", "").strip()
-                output_file = input_file.parent / f"{input_file.stem}_converted{out_ext}"
-                
-                codec_args = []
-                if ".mp3" in out_ext: codec_args = ["-c:a", "libmp3lame", "-qscale:a", "2"]
-                elif ".m4a" in out_ext: codec_args = ["-c:a", "aac", "-b:a", "192k"]
-                elif ".wav" in out_ext: codec_args = ["-c:a", "pcm_s16le"]
-                elif ".flac" in out_ext: codec_args = ["-c:a", "flac"]
-                elif ".ogg" in out_ext: codec_args = ["-c:a", "libvorbis", "-qscale:a", "5"]
+    # PROCESSING ENGINE
 
-                cmd = [ffmpeg, "-y", "-i", str(input_file)] + codec_args + [str(output_file)]
-
-            # --- IMAGE CONVERSION ---
-            else:
-                out_ext = target_fmt.split("[")[1].replace("]", "").strip()
-                output_file = input_file.parent / f"{input_file.stem}_converted{out_ext}"
-                cmd = [ffmpeg, "-y", "-i", str(input_file), str(output_file)]
-
+    def get_duration(self, file_path):
+        if FFPROBE_PATH:
             try:
-                self.run_ffmpeg_command(cmd, base_pct, file_weight)
-                self.log(f"SUCCESS -> Saved to {output_file.name}")
-            except subprocess.CalledProcessError as e:
-                self.log(f"ERROR: Failed converting {input_file.name}\n{e.stderr if hasattr(e, 'stderr') else e}")
+                cmd = [
+                    FFPROBE_PATH, "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "csv=p=0", file_path
+                ]
+                process = subprocess.run(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    text=True, creationflags=CREATE_NO_WINDOW, encoding="utf-8", errors="ignore"
+                )
+                value = process.stdout.strip()
+                if value:
+                    return float(value)
+            except Exception:
+                pass
 
-        self.status_label.config(text="✅ All Conversions Complete!")
-        self.log("\nBatch completed successfully!")
-        self.start_btn.config(state="normal")
-        messagebox.showinfo("Done", "All file conversions are complete!")
+        # Fallback: parse ffmpeg -i stderr if ffprobe isn't available
+        try:
+            cmd = [FFMPEG_PATH, "-i", file_path]
+            process = subprocess.run(
+                cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE,
+                text=True, creationflags=CREATE_NO_WINDOW, encoding="utf-8", errors="ignore"
+            )
+            match = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", process.stderr)
+            if match:
+                hrs, mins, secs = map(float, match.groups())
+                return hrs * 3600 + mins * 60 + secs
+        except Exception:
+            pass
+        return None
+
+    def build_ffmpeg_cmd(self, input_path, output_path, target_ext, is_stream_copy):
+        cmd = [FFMPEG_PATH, "-y"]
+
+        if self.gpu_type != "cpu" and not is_stream_copy:
+            cmd.extend(["-hwaccel", "auto"])
+
+        cmd.extend(["-i", input_path])
+
+        if is_stream_copy:
+            cmd.extend(["-c", "copy"])
+        else:
+            if target_ext in AUDIO_TARGET_KEYS:
+                cmd.extend(["-vn"])
+                if target_ext == "mp3":
+                    cmd.extend(["-codec:a", "libmp3lame", "-b:a", "192k"])
+                elif target_ext == "aac":
+                    cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+                elif target_ext == "opus":
+                    cmd.extend(["-c:a", "libopus", "-b:a", "128k"])
+                elif target_ext == "flac":
+                    cmd.extend(["-c:a", "flac"])
+            elif target_ext in STATIC_IMAGE_KEYS:
+                cmd.extend(["-vframes", "1"])
+            elif target_ext == "gif":
+                # Two-pass palette generation gives noticeably cleaner, less banded
+                # GIFs than the default fixed web-safe palette, for negligible extra cost.
+                cmd.extend([
+                    "-vf",
+                    "fps=15,scale=480:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
+                ])
+            elif target_ext in VIDEO_TARGET_KEYS:
+                if self.gpu_type == "amf":
+                    cmd.extend(["-c:v", "h264_amf", "-quality", "speed"])
+                elif self.gpu_type == "nvenc":
+                    cmd.extend(["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23"])
+                elif self.gpu_type == "qsv":
+                    cmd.extend(["-c:v", "h264_qsv", "-preset", "veryfast"])
+                else:
+                    cmd.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"])
+
+        cmd.extend(["-progress", "pipe:1", "-nostdin", output_path])
+        return cmd
+
+    def toggle_batch_execution(self):
+        if not self.ffmpeg_available:
+            self._show_ffmpeg_warning()
+            return
+
+        if self.is_processing:
+            self.cancel_batch()
+        else:
+            self.start_processing()
+
+    def start_processing(self):
+        if not self.file_queue or self.is_processing:
+            return
+
+        self.is_processing = True
+        self.cancel_requested = False
+        self.completed_count = 0
+        self.active_processes.clear()
+
+        self.open_folder_btn.pack_forget()
+
+        self.action_btn.configure(
+            text="Cancel Batch", 
+            fg_color="#D32F2F", 
+            hover_color="#9A0007"
+        )
+        self.clear_btn.configure(state="disabled")
+        self.browse_btn.configure(state="disabled")
+        self.reset_dest_btn.configure(state="disabled")
+        self.cat_dropdown.configure(state="disabled")
+        self.format_dropdown.configure(state="disabled")
+
+        threading.Thread(target=self._batch_executor, daemon=True).start()
+
+    def cancel_batch(self):
+        self.cancel_requested = True
+        self.status_info_label.configure(text="Cancelling processing...")
+
+        with self.queue_lock:
+            for process in self.active_processes:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+            self.active_processes.clear()
+
+    def _convert_file_worker(self, item, target_ext, is_stream_copy):
+        if self.cancel_requested:
+            return
+
+        input_path = item['path']
+        self.after(0, lambda: item['status_lbl'].configure(text="Converting...", text_color="#29B6F6"))
+
+        filename = os.path.basename(input_path)
+        base, _ = os.path.splitext(filename)
+        output_filename = f"{base}_converted.{target_ext}"
+
+        if self.custom_output_dir and os.path.exists(self.custom_output_dir):
+            output_path = os.path.join(self.custom_output_dir, output_filename)
+        else:
+            output_path = os.path.join(os.path.dirname(input_path), output_filename)
+
+        total_duration = self.get_duration(input_path)
+        cmd = self.build_ffmpeg_cmd(input_path, output_path, target_ext, is_stream_copy)
+
+        success = False
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                creationflags=CREATE_NO_WINDOW,
+                encoding="utf-8",
+                errors="ignore"
+            )
+
+            with self.queue_lock:
+                self.active_processes.append(process)
+
+            for line in iter(process.stdout.readline, ''):
+                if self.cancel_requested:
+                    break
+
+                line = line.strip()
+                if line.startswith("out_time_us=") and total_duration:
+                    try:
+                        microsecs = int(line.split("=")[1])
+                        current_secs = microsecs / 1_000_000
+                        pct = min(current_secs / total_duration, 1.0)
+                        self.after(0, lambda p=pct: item['status_lbl'].configure(text=f"{int(p * 100)}%", text_color="#29B6F6"))
+                    except ValueError:
+                        pass
+
+            process.stdout.close()
+            process.wait()
+
+            with self.queue_lock:
+                if process in self.active_processes:
+                    self.active_processes.remove(process)
+
+            if process.returncode == 0 and not self.cancel_requested:
+                success = True
+
+        except Exception:
+            success = False
+
+        # Cleanup & Status Updates
+        if self.cancel_requested:
+            self.after(0, lambda: item['status_lbl'].configure(text="Cancelled ⚠️", text_color="#FFA000"))
+            if os.path.exists(output_path):
+                try: os.remove(output_path)
+                except Exception: pass
+        elif success:
+            self.after(0, lambda: item['status_lbl'].configure(text="Completed ✅", text_color="#66BB6A"))
+        else:
+            self.after(0, lambda: item['status_lbl'].configure(text="Failed ❌", text_color="#EF5350"))
+            # Purge partial/corrupted output file on failure
+            if os.path.exists(output_path):
+                try: os.remove(output_path)
+                except Exception: pass
+
+        with self.queue_lock:
+            self.completed_count += 1
+            progress_ratio = self.completed_count / len(self.file_queue)
+            self.after(0, self._update_overall_progress, progress_ratio, self.completed_count, len(self.file_queue))
+
+    def _batch_executor(self):
+        target_ext = self.format_dropdown.get().lower()
+        is_stream_copy = self.stream_copy_var.get()
+
+        # Dynamic Core-Aware Threading (Max 4 workers, min 1, scales to hardware).
+        # GPU encoders (NVENC/AMF/QSV) commonly cap concurrent encode sessions on
+        # consumer hardware, so we deliberately keep the pool smaller when a
+        # hardware encoder is in play to avoid stalled/failed sessions.
+        cpu_cores = os.cpu_count() or 2
+        if self.gpu_type != "cpu" and not is_stream_copy:
+            max_workers = 2
+        else:
+            max_workers = max(1, min(cpu_cores // 2, 4))
+        max_workers = min(max_workers, len(self.file_queue))
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(self._convert_file_worker, item, target_ext, is_stream_copy)
+                for item in self.file_queue
+            ]
+            for future in futures:
+                future.result()
+
+        self.after(0, self._finish_batch)
+
+    def _update_overall_progress(self, ratio, current, total):
+        self.progress_bar.set(ratio)
+        if not self.cancel_requested:
+            self.status_info_label.configure(text=f"Batch Progress: {current} of {total} files completed ({int(ratio * 100)}%)")
+
+    def _finish_batch(self):
+        self.is_processing = False
+        self.action_btn.configure(
+            text="Start Batch", 
+            fg_color="#2E7D32", 
+            hover_color="#1B5E20"
+        )
+        self.clear_btn.configure(state="normal")
+        self.browse_btn.configure(state="normal")
+        self.reset_dest_btn.configure(state="normal")
+        self.cat_dropdown.configure(state="normal")
+        self.format_dropdown.configure(state="normal")
+
+        if self.cancel_requested:
+            self.status_info_label.configure(text="Batch Cancelled by User")
+        else:
+            self.progress_bar.set(1.0)
+            self.status_info_label.configure(text="Batch Processing Complete!")
+            self.open_folder_btn.pack(side="right", padx=15, pady=(0, 10))
+
+    # ==========================================
+    # YOUTUBE DOWNLOADER METHODS
+    # ==========================================
+
+    def _browse_dl_output_folder(self):
+        folder = filedialog.askdirectory()
+        if folder:
+            self.dl_custom_output_dir = folder
+            self.dl_dest_entry.configure(state="normal")
+            self.dl_dest_entry.delete(0, "end")
+            self.dl_dest_entry.insert(0, folder)
+            self.dl_dest_entry.configure(state="disabled")
+
+    def _reset_dl_output_folder(self):
+        self.dl_custom_output_dir = ""
+        self.dl_dest_entry.configure(state="normal")
+        self.dl_dest_entry.delete(0, "end")
+        self.dl_dest_entry.configure(state="disabled")
+
+    def _open_dl_output_folder(self):
+        target_dir = self.dl_custom_output_dir if self.dl_custom_output_dir else os.path.expanduser("~/Downloads")
+        if os.path.exists(target_dir):
+            if sys.platform == "win32":
+                os.startfile(target_dir)
+            else:
+                subprocess.run(["open" if sys.platform == "darwin" else "xdg-open", target_dir])
+
+    def start_download(self):
+        url = self.dl_url_entry.get().strip()
+        if not url: 
+            return
+            
+        if not HAS_YTDLP:
+            self.dl_status_label.configure(text="⚠️ yt-dlp.exe not found next to the app.", text_color="#EF5350")
+            return
+            
+        self.dl_action_btn.configure(state="disabled", text="Downloading...")
+        self.dl_progress_bar.set(0)
+        self.dl_status_label.configure(text="Initializing download...", text_color="gray")
+        
+        threading.Thread(target=self._download_worker, args=(url,), daemon=True).start()
+        
+    # Matches lines like:
+    # [download]  42.7% of  118.34MiB at    3.21MiB/s ETA 00:22
+    _DL_PROGRESS_RE = re.compile(
+        r"\[download\]\s+(\d{1,3}(?:\.\d)?)%\s+of\s+\S+\s+at\s+(\S+)\s+ETA\s+(\S+)"
+    )
+
+    def _download_worker(self, url):
+        format_choice = self.dl_format_dropdown.get()
+        out_dir = self.dl_custom_output_dir or os.path.expanduser("~/Downloads")
+        os.makedirs(out_dir, exist_ok=True)
+
+        outtmpl = os.path.join(out_dir, "%(title)s.%(ext)s")
+
+        cmd = [YTDLP_PATH, "--newline", "--no-playlist", "-o", outtmpl]
+
+        # Point yt-dlp at the bundled ffmpeg so it never falls back to PATH.
+        if FFMPEG_PATH:
+            cmd.extend(["--ffmpeg-location", os.path.dirname(FFMPEG_PATH)])
+
+        if format_choice == "Audio (MP3)":
+            cmd.extend([
+                "-f", "bestaudio/best",
+                "--extract-audio",
+                "--audio-format", "mp3",
+                "--audio-quality", "192",
+            ])
+        else:
+            cmd.extend([
+                "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                "--merge-output-format", "mp4",
+            ])
+
+        cmd.append(url)
+
+        success = False
+        error_msg = ""
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                creationflags=CREATE_NO_WINDOW,
+                encoding="utf-8",
+                errors="ignore",
+                bufsize=1,
+            )
+
+            last_lines = []
+            for line in iter(process.stdout.readline, ''):
+                line = line.strip()
+                if not line:
+                    continue
+                last_lines.append(line)
+                last_lines = last_lines[-5:]  # keep a short tail for error reporting
+
+                match = self._DL_PROGRESS_RE.search(line)
+                if match:
+                    pct = float(match.group(1)) / 100.0
+                    speed = match.group(2)
+                    eta = match.group(3)
+                    self.after(0, self._update_dl_progress, pct, speed, eta)
+                elif line.startswith("[Merger]") or line.startswith("[ExtractAudio]") or line.startswith("[ffmpeg]"):
+                    self.after(0, lambda: self.dl_status_label.configure(
+                        text="Finishing up / Converting (Please wait)...",
+                        text_color="#29B6F6"
+                    ))
+
+            process.stdout.close()
+            process.wait()
+
+            if process.returncode == 0:
+                success = True
+            else:
+                error_msg = " | ".join(last_lines)
+
+        except Exception as e:
+            error_msg = str(e)
+
+        self.after(0, self._download_complete, success, error_msg)
+
+    def _update_dl_progress(self, pct, speed, eta):
+        self.dl_progress_bar.set(pct)
+        self.dl_status_label.configure(text=f"Downloading: {int(pct*100)}% | Speed: {speed} | ETA: {eta}")
+
+    def _download_complete(self, success, error=None):
+        self.dl_action_btn.configure(state="normal", text="⬇️ Start Download")
+        if success:
+            self.dl_progress_bar.set(1.0)
+            self.dl_status_label.configure(text="Download Complete! ✅", text_color="#66BB6A")
+            self.dl_url_entry.delete(0, 'end')
+        else:
+            short_error = (error or "Check URL or network")[-120:]
+            self.dl_status_label.configure(text=f"Error ❌ {short_error}", text_color="#EF5350")
+
 
 if __name__ == "__main__":
-    if DND_AVAILABLE:
-        root = TkinterDnD.Tk()
-    else:
-        root = tk.Tk()
-        
-    app = UniversalConverterGUI(root)
-    root.mainloop()
+    app = ModernConverterApp()
+    app.mainloop()
