@@ -52,6 +52,11 @@ def get_ytdlp_path():
     return _find_bundled("yt-dlp")
 
 
+def get_icon_path():
+    candidate = os.path.join(get_app_dir(), "icon.ico")
+    return candidate if os.path.isfile(candidate) else None
+
+
 FFMPEG_PATH = get_ffmpeg_path()
 FFPROBE_PATH = get_ffprobe_path()
 YTDLP_PATH = get_ytdlp_path()
@@ -107,13 +112,59 @@ def test_encoder(encoder_name):
         return False
 
 
+def detect_gpu_vendors():
+    """
+    Best-effort detection of installed GPU vendor(s) via Windows WMI, e.g. {'nvidia'},
+    {'nvidia', 'intel'}, {'amd'}, etc. Returns an empty set if detection isn't possible
+    (non-Windows, WMI unavailable, etc.) so callers can fall back gracefully.
+    """
+    vendors = set()
+    if sys.platform != "win32":
+        return vendors
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"],
+            capture_output=True, text=True, creationflags=CREATE_NO_WINDOW,
+            encoding="utf-8", errors="ignore", timeout=5
+        )
+        output = (result.stdout or "").lower()
+        if "nvidia" in output:
+            vendors.add("nvidia")
+        if "amd" in output or "radeon" in output:
+            vendors.add("amd")
+        if "intel" in output:
+            vendors.add("intel")
+    except Exception:
+        pass
+    return vendors
+
+
 def detect_gpu_encoder():
-    if test_encoder("h264_amf"):
-        return "amf"
-    if test_encoder("h264_nvenc"):
-        return "nvenc"
-    if test_encoder("h264_qsv"):
-        return "qsv"
+    vendors = detect_gpu_vendors()
+
+    # Only test the encoder(s) for vendors we've actually confirmed are present.
+    # This avoids FFmpeg's h264_amf encoder occasionally reporting a false-positive
+    # success on a trivial 1-frame test even on machines with no AMD GPU at all,
+    # which was previously causing NVENC/QSV machines to be misreported as AMF.
+    candidates = []
+    if "nvidia" in vendors:
+        candidates.append(("nvenc", "h264_nvenc"))
+    if "amd" in vendors:
+        candidates.append(("amf", "h264_amf"))
+    if "intel" in vendors:
+        candidates.append(("qsv", "h264_qsv"))
+
+    # If vendor detection failed outright (non-Windows, WMI blocked, etc.), fall back
+    # to testing every encoder, but with NVENC checked first since it's the most
+    # common discrete GPU and the least prone to this false-positive behavior.
+    if not candidates:
+        candidates = [("nvenc", "h264_nvenc"), ("amf", "h264_amf"), ("qsv", "h264_qsv")]
+
+    for label, encoder_name in candidates:
+        if test_encoder(encoder_name):
+            return label
+
     return "cpu"
 
 
@@ -128,6 +179,13 @@ class ModernConverterApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.title("Universal Media Converter v1.4.0 (with Downloader)")
         self.geometry("920x720")
         self.minsize(820, 620)
+
+        icon_path = get_icon_path()
+        if icon_path and sys.platform == "win32":
+            try:
+                self.iconbitmap(icon_path)
+            except Exception:
+                pass
 
         # Pre-flight Check
         self.ffmpeg_available = check_ffmpeg_installed()
@@ -639,6 +697,7 @@ class ModernConverterApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.cancel_requested = False
         self.completed_count = 0
         self.active_processes.clear()
+        self.file_progress = {item['path']: 0.0 for item in self.file_queue}
 
         self.open_folder_btn.pack_forget()
 
@@ -711,7 +770,7 @@ class ModernConverterApp(ctk.CTk, TkinterDnD.DnDWrapper):
                         microsecs = int(line.split("=")[1])
                         current_secs = microsecs / 1_000_000
                         pct = min(current_secs / total_duration, 1.0)
-                        self.after(0, lambda p=pct: item['status_lbl'].configure(text=f"{int(p * 100)}%", text_color="#29B6F6"))
+                        self.after(0, lambda p=pct: self._on_convert_progress(item, p))
                     except ValueError:
                         pass
 
@@ -736,8 +795,10 @@ class ModernConverterApp(ctk.CTk, TkinterDnD.DnDWrapper):
                 except Exception: pass
         elif success:
             self.after(0, lambda: item['status_lbl'].configure(text="Completed ✅", text_color="#66BB6A"))
+            self.after(0, lambda: self._finalize_file_progress(item['path']))
         else:
             self.after(0, lambda: item['status_lbl'].configure(text="Failed ❌", text_color="#EF5350"))
+            self.after(0, lambda: self._finalize_file_progress(item['path']))
             # Purge partial/corrupted output file on failure
             if os.path.exists(output_path):
                 try: os.remove(output_path)
@@ -773,8 +834,25 @@ class ModernConverterApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
         self.after(0, self._finish_batch)
 
+    def _on_convert_progress(self, item, pct):
+        """Called on the main thread as a single file's FFmpeg progress updates."""
+        item['status_lbl'].configure(text=f"{int(pct * 100)}%", text_color="#29B6F6")
+        self.file_progress[item['path']] = pct
+        self._refresh_progress_bar()
+
+    def _finalize_file_progress(self, path):
+        """Called on the main thread once a file's conversion has resolved (success/failure)."""
+        self.file_progress[path] = 1.0
+        self._refresh_progress_bar()
+
+    def _refresh_progress_bar(self):
+        """Recomputes the bottom progress bar as the average progress across all queued files."""
+        if self.cancel_requested or not self.file_queue:
+            return
+        aggregate = sum(self.file_progress.values()) / len(self.file_queue)
+        self.progress_bar.set(aggregate)
+
     def _update_overall_progress(self, ratio, current, total):
-        self.progress_bar.set(ratio)
         if not self.cancel_requested:
             self.status_info_label.configure(text=f"Batch Progress: {current} of {total} files completed ({int(ratio * 100)}%)")
 
