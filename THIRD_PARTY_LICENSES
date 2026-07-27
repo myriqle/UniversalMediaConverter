@@ -1,0 +1,96 @@
+# Third-Party Software & Licenses
+
+Universal Media Toolkit bundles or depends on the following third-party software. This app's own source code is MIT-licensed (see [`LICENSE`](LICENSE)); the components below retain their own original licenses.
+
+---
+
+## FFmpeg / FFprobe
+
+- **Project:** https://ffmpeg.org
+- **License:** LGPL v2.1+ (if built without `--enable-gpl`) or GPL v2+ (if built with GPL-licensed components enabled)
+- **Used as:** bundled standalone executables (`ffmpeg.exe`, `ffprobe.exe`), invoked as external processes. Not statically linked into this app's code.
+
+FFmpeg is a trademark of Fabrice Bellard, originator of the FFmpeg project. This project is not affiliated with or endorsed by the FFmpeg project.
+
+**Build note:** this app should be distributed with an **LGPL-only** FFmpeg build (no `--enable-gpl` codecs) to avoid the combined distribution being subject to GPL terms. If you swap in a GPL build, review GPL compliance obligations before redistributing.
+
+Full license text: https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html (or https://www.gnu.org/licenses/gpl-2.0.html for GPL builds)
+
+---
+
+## yt-dlp
+
+- **Project:** https://github.com/yt-dlp/yt-dlp
+- **License:** [Unlicense](https://github.com/yt-dlp/yt-dlp/blob/master/LICENSE) (public domain equivalent)
+- **Used as:** a bundled standalone executable (`yt-dlp.exe`), invoked as an external process for the YouTube Downloader tab.
+
+yt-dlp is provided under the Unlicense, which places it in the public domain / imposes no restrictions on use, modification, or redistribution. No attribution is legally required, but it's included here for transparency about what this app bundles and relies on.
+
+---
+
+## CustomTkinter
+
+- **Project:** https://github.com/TomSchimansky/CustomTkinter
+- **License:** MIT License
+- **Used as:** a Python library dependency, imported directly into this app's source (`converter.py`).
+
+```
+MIT License
+Copyright (c) 2023 Tom Schimansky
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+---
+
+## tkinterdnd2
+
+- **Project:** https://github.com/pmgagne/tkinterdnd2
+- **License:** MIT License
+- **Used as:** a Python library dependency, imported directly into this app's source (`converter.py`), providing native drag-and-drop support.
+
+```
+MIT License
+Copyright (c) tkinterdnd2 contributors
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+---
+
+## Build tooling (not distributed, no attribution required)
+
+The following are used only to *build* this app and are not shipped as part of the final distributed software, so no license notice is required for them — listed here for transparency:
+
+- **[Nuitka](https://nuitka.net/)** (Apache License 2.0) — compiles the Python source to a standalone executable.
+- **[Inno Setup](https://jrsoftware.org/isinfo.php)** (its own free-for-any-use license) — packages the standalone build into `Setup.exe`.
+
+---
+
+*Please double-check the exact FFmpeg build variant (LGPL vs GPL) you ship and update the note above accordingly. If you change which binaries or libraries this app bundles, update this file to match.*
